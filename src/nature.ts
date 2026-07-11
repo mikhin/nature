@@ -27,7 +27,7 @@ export interface Store {
   restore(snap: Map<string, Row>): void
 }
 type LNature = { name: string; initial: string | undefined; shape: Record<string, Field<unknown>>; invariants: Record<string, (s: Row) => boolean> }
-type Spec = { name: string; onName: string; from: string | undefined; to: string | undefined; when: ((a: Row, t: Row) => boolean) | undefined; effect: ((t: Row) => Record<string, unknown>) | undefined }
+type Spec = { name: string; onName: string; from: string | undefined; to: string | undefined; input: Record<string, Field<unknown>> | undefined; when: ((a: Row, t: Row, i: Row) => boolean) | undefined; effect: ((t: Row, i: Row) => Record<string, unknown>) | undefined }
 
 // ─── FIELD TYPES (a zod replacement, zero-dep) ────────────────────────────────
 export const T = {
@@ -38,6 +38,16 @@ export const T = {
   unknown: (_v: unknown): _v is unknown => true,                        // an unknowable field (external nature)
   oneOf: <const A extends readonly string[]>(...o: A): Field<A[number]> =>
     (v: unknown): v is A[number] => (o as readonly string[]).includes(v as string),
+  list: <S>(shape: S): Field<Array<Infer<S>>> =>                        // a list of records, each matching `shape`
+    (v: unknown): v is Array<Infer<S>> => Array.isArray(v) && v.every(item => {
+      if (item === null || typeof item !== "object") return false
+      const rec = item as Record<string, unknown>
+      for (const k in shape as Record<string, unknown>) {
+        const g = (shape as Record<string, (x: unknown) => boolean>)[k]
+        if (g && !g(rec[k])) return false
+      }
+      return true
+    }),
 }
 
 export const UNKNOWN = Symbol("unknown")     // a field value that is unavailable (observe → "unknown")
@@ -133,7 +143,9 @@ export function observe<S, R>(_n: Nature<S>, id: string, ask: (s: Being<S>) => R
   return (r as unknown) === UNKNOWN ? "unknown" : r
 }
 
-// action: anchored on the actor, targets on. from = state precondition, when = about the actor (both typed)
+// action: anchored on the actor, targets on. from = state precondition, when = about the actor.
+// No payload → a 2-arg call. Need a payload (addMilestone{label,date}, rename{title})? chain
+// `.input(shape, { when, effect })` — a separate call so the input type is inferred cleanly.
 export function action<AS, TS>(_actor: Nature<AS>, name: string, def: {
   on: Nature<TS>
   from?: string
@@ -141,24 +153,39 @@ export function action<AS, TS>(_actor: Nature<AS>, name: string, def: {
   when?: (actor: Being<NoInfer<AS>>, target: Being<NoInfer<TS>>) => boolean
   effect?: (target: Being<NoInfer<TS>>) => Partial<Infer<NoInfer<TS>>>
 }) {
-  const userWhen = def.when
-  const userEffect = def.effect
+  const w0 = def.when
+  const e0 = def.effect
   const spec: Spec = {
-    name, onName: def.on.name, from: def.from, to: def.to,
-    when: userWhen ? (a, t) => userWhen(a as unknown as Being<AS>, t as unknown as Being<TS>) : undefined,
-    effect: userEffect ? (t) => userEffect(t as unknown as Being<TS>) as Record<string, unknown> : undefined,
+    name, onName: def.on.name, from: def.from, to: def.to, input: undefined,
+    when: w0 ? (a, t) => w0(a as unknown as Being<AS>, t as unknown as Being<TS>) : undefined,
+    effect: e0 ? (t) => e0(t as unknown as Being<TS>) as Record<string, unknown> : undefined,
   }
   registry.set(def.on.name, [...(registry.get(def.on.name) ?? []), spec])
   const target = def.on as unknown as LNature
-  return (actorId: string, targetId: string): Result => {
+  const run = (actorId: string, targetId: string, input?: Record<string, unknown>): Result => {
+    const inp = (input ?? {}) as Row
     const who = store.get(actorId) ?? {}
     const t = store.get(targetId)
     if (t === undefined) return { ok: false, why: `no being "${targetId}"` }
     if (def.from != null && t.__state !== def.from) return { ok: false, why: `not allowed from "${t.__state}" (${name})` }
-    if (spec.when && !spec.when(who, t)) return { ok: false, why: `forbidden (${name})` }
-    const patch = spec.effect ? spec.effect(t) : {}
+    if (spec.input) for (const k in spec.input) { const g = spec.input[k]; if (g && !g(inp[k])) return { ok: false, why: `input ${k}: wrong type` } }
+    if (spec.when && !spec.when(who, t, inp)) return { ok: false, why: `forbidden (${name})` }
+    const patch = spec.effect ? spec.effect(t, inp) : {}
     return commit(target, targetId, { ...t, ...patch, ...(def.to != null ? { __state: def.to } : {}) })
   }
+  const call = (actorId: string, targetId: string): Result => run(actorId, targetId)
+  return Object.assign(call, {
+    // add a typed payload — IS is inferred from `shape` and reused in `handlers` (cross-arg, reliable)
+    input<IS extends Record<string, Field<unknown>>>(shape: IS, handlers: {
+      when?: (actor: Being<NoInfer<AS>>, target: Being<NoInfer<TS>>, input: Infer<IS>) => boolean
+      effect?: (target: Being<NoInfer<TS>>, input: Infer<IS>) => Partial<Infer<NoInfer<TS>>>
+    }): (actorId: string, targetId: string, input: Infer<IS>) => Result {
+      spec.input = shape
+      spec.when = handlers.when ? (a, t, i) => handlers.when!(a as unknown as Being<AS>, t as unknown as Being<TS>, i as unknown as Infer<IS>) : undefined
+      spec.effect = handlers.effect ? (t, i) => handlers.effect!(t as unknown as Being<TS>, i as unknown as Infer<IS>) as Record<string, unknown> : undefined
+      return (actorId, targetId, input) => run(actorId, targetId, input as Record<string, unknown>)
+    },
+  })
 }
 
 // spawn a being (validated through the same door as every write)
