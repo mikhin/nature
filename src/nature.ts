@@ -1,0 +1,163 @@
+// nature — a spec-first kernel on three words. zero-dep, zero-any (in the public API).
+//
+//   nature  — what a thing IS (a shape of type-guards + invariants)
+//   observe — what I want to KNOW (pure read; absent / unknown are honest outcomes)
+//   action  — what I want to DO (anchored on the actor; from = state, when = about the actor)
+//
+// Everything else (machine, diagram, tests, decision tables, policies) is a projection of the spec.
+
+// ─── PUBLIC TYPES ─────────────────────────────────────────────────────────────
+export type Field<A> = (v: unknown) => v is A                            // a field is a type guard that carries its type
+export type Infer<S> = { [K in keyof S]: S[K] extends (v: unknown) => v is infer A ? A : never } // shape → field types
+export type Being<S> = Infer<S> & { __state?: string }                  // a being = fields + machine state
+export type Nature<S> = { name: string; initial: string | undefined; shape: S; invariants: Record<string, (s: Being<S>) => boolean> }
+export type Result = { ok: true } | { ok: false; why: string }
+export type Case = { name: string; action: string; seed: string; expect: "ok" | "blocked"; to: string | undefined }
+
+// erased row in the store + erased spec: the dynamic core runs on unknown, without any
+type Row = { __state?: string; [k: string]: unknown }
+type LNature = { name: string; initial: string | undefined; shape: Record<string, Field<unknown>>; invariants: Record<string, (s: Row) => boolean> }
+type Spec = { name: string; onName: string; from: string | undefined; to: string | undefined; when: ((a: Row, t: Row) => boolean) | undefined; effect: ((t: Row) => Record<string, unknown>) | undefined }
+
+// ─── FIELD TYPES (a zod replacement, zero-dep) ────────────────────────────────
+export const T = {
+  num: (v: unknown): v is number => typeof v === "number",
+  str: (v: unknown): v is string => typeof v === "string",
+  bool: (v: unknown): v is boolean => typeof v === "boolean",
+  unknown: (_v: unknown): _v is unknown => true,                        // an unknowable field (external nature)
+  oneOf: <const A extends readonly string[]>(...o: A): Field<A[number]> =>
+    (v: unknown): v is A[number] => (o as readonly string[]).includes(v as string),
+}
+
+export const UNKNOWN = Symbol("unknown")     // a field value that is unavailable (observe → "unknown")
+const world = new Map<string, Row>()         // state lives outside, keyed by id
+const registry = new Map<string, Spec[]>()   // actions keyed by target nature name
+
+/** Clear all state and the registry (for tests / isolation). */
+export function reset(): void { world.clear(); registry.clear() }
+
+// nature: shape and invariants in TWO calls, otherwise S co-infers to unknown
+export function nature<S>(name: string, shape: S, initial?: string) {
+  const base: Nature<S> = { name, initial, shape, invariants: {} }
+  return Object.assign(base, {
+    rules(invariants: Record<string, (s: Being<NoInfer<S>>) => boolean>): Nature<S> {
+      return { ...base, invariants }
+    },
+  })
+}
+
+// the machine is DERIVED from actions (from/to are data)
+export function machineOf(n: { name: string }): { states: string[]; edges: Array<{ action: string; from: string | undefined; to: string | undefined }> } {
+  const specs = (registry.get(n.name) ?? []).filter(s => s.from != null || s.to != null)
+  const edges = specs.map(s => ({ action: s.name, from: s.from, to: s.to }))
+  const states = [...new Set(edges.flatMap(e => [e.from, e.to]).filter((x): x is string => x != null))]
+  return { states, edges }
+}
+
+// graph analysis: reachability from initial, unreachable states, dead ends
+export function analyze(n: { name: string; initial: string | undefined }): { initial: string[]; unreachable: string[]; deadEnds: string[] } {
+  const { states, edges } = machineOf(n)
+  const incoming = new Set(edges.map(e => e.to))
+  const outgoing = new Set(edges.map(e => e.from))
+  const initial = n.initial != null ? [n.initial] : states.filter(s => !incoming.has(s))
+  const reachable = new Set(initial)
+  let frontier = [...initial]
+  while (frontier.length > 0) {
+    const next: string[] = []
+    for (const s of frontier) for (const e of edges) if (e.from === s && e.to != null && !reachable.has(e.to)) { reachable.add(e.to); next.push(e.to) }
+    frontier = next
+  }
+  return { initial, unreachable: states.filter(s => !reachable.has(s)), deadEnds: states.filter(s => !outgoing.has(s)) }
+}
+
+// diagram — a projection of the machine (not codegen, computed on the fly)
+export const mermaidOf = (n: { name: string }): string =>
+  ["stateDiagram-v2", ...machineOf(n).edges.map(e => `  ${e.from} --> ${e.to}: ${e.action}`)].join("\n")
+
+// BDD — test cases derived from the machine (no files → nothing to go stale)
+export function testsFor(n: { name: string }): Case[] {
+  const { states } = machineOf(n)
+  const cases: Case[] = []
+  for (const s of registry.get(n.name) ?? []) {
+    if (s.from == null) continue
+    cases.push({ name: `${s.name}: ${s.from}→${s.to}`, action: s.name, seed: s.from, expect: "ok", to: s.to })
+    const wrong = states.find(st => st !== s.from)
+    if (wrong !== undefined) cases.push({ name: `${s.name}: from "${wrong}" → blocked`, action: s.name, seed: wrong, expect: "blocked", to: undefined })
+  }
+  return cases
+}
+
+// the ONLY door into world — both create and action go through here
+function commit(n: LNature, id: string, next: Row): Result {
+  const st = next.__state
+  if (st !== undefined) {
+    const { states } = machineOf(n)
+    if (states.length > 0 && !states.includes(st)) return { ok: false, why: `state "${st}" not in machine ${n.name}` }
+  }
+  for (const k in n.shape) { const g = n.shape[k]; if (g && k in next && !g(next[k])) return { ok: false, why: `field ${k}: wrong type` } }
+  for (const label in n.invariants) { const inv = n.invariants[label]; if (inv && !inv(next)) return { ok: false, why: `invariant: ${label}` } }
+  world.set(id, { ...next })
+  return { ok: true }
+}
+
+// observe: typed by the being. three outcomes — value · absent (no id) · unknown (field unavailable)
+export function observe<S, R>(_n: Nature<S>, id: string, ask: (s: Being<S>) => R): R | "absent" | "unknown" {
+  const row = world.get(id)
+  if (row === undefined) return "absent"
+  const r = ask(row as unknown as Being<S>)
+  return (r as unknown) === UNKNOWN ? "unknown" : r
+}
+
+// action: anchored on the actor, targets on. from = state precondition, when = about the actor (both typed)
+export function action<AS, TS>(_actor: Nature<AS>, name: string, def: {
+  on: Nature<TS>
+  from?: string
+  to?: string
+  when?: (actor: Being<NoInfer<AS>>, target: Being<NoInfer<TS>>) => boolean
+  effect?: (target: Being<NoInfer<TS>>) => Partial<Infer<NoInfer<TS>>>
+}) {
+  const userWhen = def.when
+  const userEffect = def.effect
+  const spec: Spec = {
+    name, onName: def.on.name, from: def.from, to: def.to,
+    when: userWhen ? (a, t) => userWhen(a as unknown as Being<AS>, t as unknown as Being<TS>) : undefined,
+    effect: userEffect ? (t) => userEffect(t as unknown as Being<TS>) as Record<string, unknown> : undefined,
+  }
+  registry.set(def.on.name, [...(registry.get(def.on.name) ?? []), spec])
+  const target = def.on as unknown as LNature
+  return (actorId: string, targetId: string): Result => {
+    const who = world.get(actorId) ?? {}
+    const t = world.get(targetId)
+    if (t === undefined) return { ok: false, why: `no being "${targetId}"` }
+    if (def.from != null && t.__state !== def.from) return { ok: false, why: `not allowed from "${t.__state}" (${name})` }
+    if (spec.when && !spec.when(who, t)) return { ok: false, why: `forbidden (${name})` }
+    const patch = spec.effect ? spec.effect(t) : {}
+    return commit(target, targetId, { ...t, ...patch, ...(def.to != null ? { __state: def.to } : {}) })
+  }
+}
+
+// spawn a being (validated through the same door as every write)
+export function create<S>(n: Nature<S>, id: string, props: Infer<S>, init?: string): Result {
+  const row = { ...(props as Record<string, unknown>), ...(init != null ? { __state: init } : {}) }
+  return commit(n as unknown as LNature, id, row)
+}
+
+// current machine state of a being
+export const stateOf = (id: string): string | undefined | "absent" => { const r = world.get(id); return r === undefined ? "absent" : r.__state }
+
+// sequence: fail-fast, NO rollback (the name is honest)
+export const sequence = (name: string, steps: Array<() => Result>) => (): Result => {
+  for (const step of steps) { const r = step(); if (!r.ok) return { ok: false, why: `${name}: ${r.why}` } }
+  return { ok: true }
+}
+
+// transaction: a failed step rolls back all internal state.
+// NOTE: only state in world is rolled back; external effects cannot be undone — that is compensation/saga.
+export const transaction = (name: string, steps: Array<() => Result>) => (): Result => {
+  const backup = new Map(world)                 // commit stores a fresh row object → a shallow Map copy is enough
+  for (const step of steps) {
+    const r = step()
+    if (!r.ok) { world.clear(); for (const [k, v] of backup) world.set(k, v); return { ok: false, why: `${name} rolled back: ${r.why}` } }
+  }
+  return { ok: true }
+}

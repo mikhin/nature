@@ -1,0 +1,28 @@
+{
+  "name": "nature",
+  "version": "0.0.0",
+  "description": "A spec-first kernel on three primitives: nature / observe / action. zero-dep, zero-any; the state machine, diagram and tests are derived from the spec.",
+  "type": "module",
+  "types": "./dist/nature.d.ts",
+  "main": "./dist/nature.js",
+  "module": "./dist/nature.js",
+  "exports": {
+    ".": {
+      "types": "./dist/nature.d.ts",
+      "default": "./dist/nature.js"
+    }
+  },
+  "files": ["dist", "src", "README.md", "LICENSE"],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "example": "node examples/demo.ts",
+    "prepare": "tsc -p tsconfig.build.json"
+  },
+  "keywords": ["spec-first", "dsl", "state-machine", "domain", "zero-dep", "typescript"],
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  }
+}
