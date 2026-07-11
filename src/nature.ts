@@ -162,7 +162,8 @@ export function action<AS, TS>(_actor: Nature<AS>, name: string, def: {
   }
   registry.set(def.on.name, [...(registry.get(def.on.name) ?? []), spec])
   const target = def.on as unknown as LNature
-  const run = (actorId: string, targetId: string, input?: Record<string, unknown>): Result => {
+  // check runs from/input/when WITHOUT committing — the basis for both run() and .allowed()
+  const check = (actorId: string, targetId: string, input?: Record<string, unknown>): Result => {
     const inp = (input ?? {}) as Row
     const who = store.get(actorId) ?? {}
     const t = store.get(targetId)
@@ -170,20 +171,32 @@ export function action<AS, TS>(_actor: Nature<AS>, name: string, def: {
     if (def.from != null && t.__state !== def.from) return { ok: false, why: `not allowed from "${t.__state}" (${name})` }
     if (spec.input) for (const k in spec.input) { const g = spec.input[k]; if (g && !g(inp[k])) return { ok: false, why: `input ${k}: wrong type` } }
     if (spec.when && !spec.when(who, t, inp)) return { ok: false, why: `forbidden (${name})` }
+    return { ok: true }
+  }
+  const run = (actorId: string, targetId: string, input?: Record<string, unknown>): Result => {
+    const c = check(actorId, targetId, input)
+    if (!c.ok) return c
+    const inp = (input ?? {}) as Row
+    const t = store.get(targetId) as Row
     const patch = spec.effect ? spec.effect(t, inp) : {}
     return commit(target, targetId, { ...t, ...patch, ...(def.to != null ? { __state: def.to } : {}) })
   }
   const call = (actorId: string, targetId: string): Result => run(actorId, targetId)
   return Object.assign(call, {
+    // would this action proceed right now? drives UI (disable a button) with NO drift from the spec
+    allowed: (actorId: string, targetId: string): boolean => check(actorId, targetId).ok,
     // add a typed payload — IS is inferred from `shape` and reused in `handlers` (cross-arg, reliable)
     input<IS extends Record<string, Field<unknown>>>(shape: IS, handlers: {
       when?: (actor: Being<NoInfer<AS>>, target: Being<NoInfer<TS>>, input: Infer<IS>) => boolean
       effect?: (target: Being<NoInfer<TS>>, input: Infer<IS>) => Partial<Infer<NoInfer<TS>>>
-    }): (actorId: string, targetId: string, input: Infer<IS>) => Result {
+    }) {
       spec.input = shape
       spec.when = handlers.when ? (a, t, i) => handlers.when!(a as unknown as Being<AS>, t as unknown as Being<TS>, i as unknown as Infer<IS>) : undefined
       spec.effect = handlers.effect ? (t, i) => handlers.effect!(t as unknown as Being<TS>, i as unknown as Infer<IS>) as Record<string, unknown> : undefined
-      return (actorId, targetId, input) => run(actorId, targetId, input as Record<string, unknown>)
+      const runIn = (actorId: string, targetId: string, input: Infer<IS>): Result => run(actorId, targetId, input as Record<string, unknown>)
+      return Object.assign(runIn, {
+        allowed: (actorId: string, targetId: string, input: Infer<IS>): boolean => check(actorId, targetId, input as Record<string, unknown>).ok,
+      })
     },
   })
 }

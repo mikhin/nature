@@ -27,7 +27,7 @@ observe(Order, "o1", o => o.total)             // 42
 
 - **`nature(name, shape, initial?)`** — what a thing *is*: a `shape` of type-guard fields + `.rules({ invariants })`. The being's type is **inferred from the shape** (like zod, in ~3 lines, no codegen).
 - **`observe(nature, id, ask)`** — pure read. Three outcomes: the value · `"absent"` (no such id — catches typos) · `"unknown"` (a field is genuinely unknowable, e.g. an external nature).
-- **`action(actor, name, { on, from, to, when, effect })`** — the only mutator. Anchored on the **actor** (so authorization lives in `when`), targets `on`, gated by the target's state (`from`) and invariants.
+- **`action(actor, name, { on, from, to, when, effect })`** — the only mutator. Anchored on the **actor** (so authorization lives in `when`), targets `on`, gated by the target's state (`from`) and invariants. Need a typed payload? chain `.input(shape, { when, effect })`. Ask `action.allowed(actorId, targetId, input?)` whether it would proceed — bind a button's disabled state to that and it can't drift from the spec.
 
 Everything else composes from these: a decision table is an `observe` over data, a policy is `observe → action`, a saga is an `action` made of actions.
 
