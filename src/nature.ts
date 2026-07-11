@@ -15,7 +15,17 @@ export type Result = { ok: true } | { ok: false; why: string }
 export type Case = { name: string; action: string; seed: string; expect: "ok" | "blocked"; to: string | undefined }
 
 // erased row in the store + erased spec: the dynamic core runs on unknown, without any
-type Row = { __state?: string; [k: string]: unknown }
+export type Row = { __state?: string; [k: string]: unknown }
+
+// Where beings live. nature does NOT own storage — inject your own (a blob, a DB, synced state).
+// The default is in-memory; a store adapter is responsible for its own serialization format.
+export interface Store {
+  get(id: string): Row | undefined
+  set(id: string, row: Row): void
+  delete(id: string): void
+  snapshot(): Map<string, Row>          // for transaction rollback
+  restore(snap: Map<string, Row>): void
+}
 type LNature = { name: string; initial: string | undefined; shape: Record<string, Field<unknown>>; invariants: Record<string, (s: Row) => boolean> }
 type Spec = { name: string; onName: string; from: string | undefined; to: string | undefined; when: ((a: Row, t: Row) => boolean) | undefined; effect: ((t: Row) => Record<string, unknown>) | undefined }
 
@@ -24,17 +34,32 @@ export const T = {
   num: (v: unknown): v is number => typeof v === "number",
   str: (v: unknown): v is string => typeof v === "string",
   bool: (v: unknown): v is boolean => typeof v === "boolean",
+  date: (v: unknown): v is Date => v instanceof Date && !Number.isNaN(v.getTime()), // real Date; the store adapter handles persistence format
   unknown: (_v: unknown): _v is unknown => true,                        // an unknowable field (external nature)
   oneOf: <const A extends readonly string[]>(...o: A): Field<A[number]> =>
     (v: unknown): v is A[number] => (o as readonly string[]).includes(v as string),
 }
 
 export const UNKNOWN = Symbol("unknown")     // a field value that is unavailable (observe → "unknown")
-const world = new Map<string, Row>()         // state lives outside, keyed by id
-const registry = new Map<string, Spec[]>()   // actions keyed by target nature name
+
+// default in-memory store; swap it with useStore() to put beings anywhere
+class MapStore implements Store {
+  private m = new Map<string, Row>()
+  get(id: string): Row | undefined { return this.m.get(id) }
+  set(id: string, row: Row): void { this.m.set(id, row) }
+  delete(id: string): void { this.m.delete(id) }
+  snapshot(): Map<string, Row> { return new Map(this.m) }
+  restore(snap: Map<string, Row>): void { this.m = new Map(snap) }
+}
+
+let store: Store = new MapStore()            // state lives outside; nature just reads/writes through this
+const registry = new Map<string, Spec[]>()   // the spec (actions keyed by target nature) — defined at load, not runtime state
+
+/** Inject a custom store (blob, DB, Figma synced state, …). */
+export function useStore(s: Store): void { store = s }
 
 /** Clear all state and the registry (for tests / isolation). */
-export function reset(): void { world.clear(); registry.clear() }
+export function reset(): void { store.restore(new Map()); registry.clear() }
 
 // nature: shape and invariants in TWO calls, otherwise S co-infers to unknown
 export function nature<S>(name: string, shape: S, initial?: string) {
@@ -87,7 +112,7 @@ export function testsFor(n: { name: string }): Case[] {
   return cases
 }
 
-// the ONLY door into world — both create and action go through here
+// the ONLY door into the store — both create and action go through here
 function commit(n: LNature, id: string, next: Row): Result {
   const st = next.__state
   if (st !== undefined) {
@@ -96,13 +121,13 @@ function commit(n: LNature, id: string, next: Row): Result {
   }
   for (const k in n.shape) { const g = n.shape[k]; if (g && k in next && !g(next[k])) return { ok: false, why: `field ${k}: wrong type` } }
   for (const label in n.invariants) { const inv = n.invariants[label]; if (inv && !inv(next)) return { ok: false, why: `invariant: ${label}` } }
-  world.set(id, { ...next })
+  store.set(id, { ...next })
   return { ok: true }
 }
 
 // observe: typed by the being. three outcomes — value · absent (no id) · unknown (field unavailable)
 export function observe<S, R>(_n: Nature<S>, id: string, ask: (s: Being<S>) => R): R | "absent" | "unknown" {
-  const row = world.get(id)
+  const row = store.get(id)
   if (row === undefined) return "absent"
   const r = ask(row as unknown as Being<S>)
   return (r as unknown) === UNKNOWN ? "unknown" : r
@@ -126,8 +151,8 @@ export function action<AS, TS>(_actor: Nature<AS>, name: string, def: {
   registry.set(def.on.name, [...(registry.get(def.on.name) ?? []), spec])
   const target = def.on as unknown as LNature
   return (actorId: string, targetId: string): Result => {
-    const who = world.get(actorId) ?? {}
-    const t = world.get(targetId)
+    const who = store.get(actorId) ?? {}
+    const t = store.get(targetId)
     if (t === undefined) return { ok: false, why: `no being "${targetId}"` }
     if (def.from != null && t.__state !== def.from) return { ok: false, why: `not allowed from "${t.__state}" (${name})` }
     if (spec.when && !spec.when(who, t)) return { ok: false, why: `forbidden (${name})` }
@@ -142,8 +167,15 @@ export function create<S>(n: Nature<S>, id: string, props: Infer<S>, init?: stri
   return commit(n as unknown as LNature, id, row)
 }
 
+// remove a being (delete). validated: the being must exist.
+export function destroy<S>(_n: Nature<S>, id: string): Result {
+  if (store.get(id) === undefined) return { ok: false, why: `no being "${id}"` }
+  store.delete(id)
+  return { ok: true }
+}
+
 // current machine state of a being
-export const stateOf = (id: string): string | undefined | "absent" => { const r = world.get(id); return r === undefined ? "absent" : r.__state }
+export const stateOf = (id: string): string | undefined | "absent" => { const r = store.get(id); return r === undefined ? "absent" : r.__state }
 
 // sequence: fail-fast, NO rollback (the name is honest)
 export const sequence = (name: string, steps: Array<() => Result>) => (): Result => {
@@ -152,12 +184,12 @@ export const sequence = (name: string, steps: Array<() => Result>) => (): Result
 }
 
 // transaction: a failed step rolls back all internal state.
-// NOTE: only state in world is rolled back; external effects cannot be undone — that is compensation/saga.
+// NOTE: only state in the store is rolled back; external effects cannot be undone — that is compensation/saga.
 export const transaction = (name: string, steps: Array<() => Result>) => (): Result => {
-  const backup = new Map(world)                 // commit stores a fresh row object → a shallow Map copy is enough
+  const backup = store.snapshot()               // commit stores a fresh row object → a shallow snapshot is enough
   for (const step of steps) {
     const r = step()
-    if (!r.ok) { world.clear(); for (const [k, v] of backup) world.set(k, v); return { ok: false, why: `${name} rolled back: ${r.why}` } }
+    if (!r.ok) { store.restore(backup); return { ok: false, why: `${name} rolled back: ${r.why}` } }
   }
   return { ok: true }
 }
