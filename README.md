@@ -38,6 +38,19 @@ machineOf(Order)   // { states, edges } — the state machine, assembled from al
 analyze(Order)     // { initial, unreachable, deadEnds } — reachability check
 mermaidOf(Order)   // a mermaid stateDiagram string
 testsFor(Order)    // BDD cases derived from the machine + guards
+scenariosOf(Order) // Given/When/Then strings rendered from executed .example() cases
+```
+
+### Executable scenarios (`.example`)
+
+Attach examples to an action; each one **runs at define time against the real guard**, so a
+scenario can't drift from behavior. `scenariosOf` renders them as Given/When/Then;
+`exampleResults` reports any mismatch (assert none failed in a test).
+
+```ts
+const submit = action(Customer, "submit", { on: Order, from: "draft", to: "pending" })
+  .example("a draft order can be submitted", { actor: {}, target: { __state: "draft" } }, "ok")
+  .example("a paid order cannot",            { actor: {}, target: { __state: "paid" } },  "blocked")
 ```
 
 ## Also

@@ -1,5 +1,5 @@
 // Example of using nature as a library.  run:  node examples/demo.ts
-import { nature, action, create, observe, stateOf, sequence, transaction, analyze, mermaidOf, testsFor, T, UNKNOWN } from "../src/nature.ts"
+import { nature, action, create, observe, stateOf, sequence, transaction, analyze, mermaidOf, testsFor, scenariosOf, exampleResults, T, UNKNOWN } from "../src/nature.ts"
 
 declare const console: { log: (...a: unknown[]) => void }
 
@@ -12,6 +12,9 @@ const Delivery = nature("Delivery", { price: T.num, note: T.str, gift: T.bool },
 })
 
 const order   = action(Me, "order",   { on: Delivery, from: "idle",    to: "ordered",   when: who => who.role === "customer" }) // who.role: "customer"|"guest"
+  // executed scenarios — run at define time against the real guard, so they cannot lie:
+  .example("a customer can order an idle delivery", { actor: { role: "customer" }, target: { __state: "idle", price: 1, note: "x", gift: false } }, "ok")
+  .example("a guest cannot order", { actor: { role: "guest" }, target: { __state: "idle", price: 1, note: "x", gift: false } }, "blocked")
 const pay     = action(Me, "pay",     { on: Delivery, from: "ordered", to: "paid" })
 const receive = action(Me, "receive", { on: Delivery, from: "paid",    to: "done" })
 const cancel  = action(Me, "cancel",  { on: Delivery, from: "ordered", to: "cancelled" })
@@ -60,3 +63,7 @@ for (const c of suite) {
   else fails.push(c.name)
 }
 console.log("derived tests:         ", `${passed}/${suite.length} passed`, fails.length > 0 ? `✗ ${fails.join(", ")}` : "✓")
+
+console.log("\nscenarios (from examples):\n" + scenariosOf(Delivery).join("\n"))
+const exFails = exampleResults(Delivery).filter(r => !r.pass)
+console.log("\nexamples:                ", exFails.length === 0 ? "all match ✓" : `✗ ${exFails.map(f => f.name).join(", ")}`)

@@ -27,7 +27,8 @@ export interface Store {
   restore(snap: Map<string, Row>): void
 }
 type LNature = { name: string; initial: string | undefined; shape: Record<string, Field<unknown>>; invariants: Record<string, (s: Row) => boolean> }
-type Spec = { name: string; onName: string; from: string | undefined; to: string | undefined; input: Record<string, Field<unknown>> | undefined; when: ((a: Row, t: Row, i: Row) => boolean) | undefined; effect: ((t: Row, i: Row) => Record<string, unknown>) | undefined }
+type Example = { name: string; actor: Row; target: Row; input: Row; expect: "ok" | "blocked"; actual: "ok" | "blocked"; why: string | undefined }
+type Spec = { name: string; onName: string; from: string | undefined; to: string | undefined; input: Record<string, Field<unknown>> | undefined; when: ((a: Row, t: Row, i: Row) => boolean) | undefined; effect: ((t: Row, i: Row) => Record<string, unknown>) | undefined; examples: Example[] }
 
 // ─── FIELD TYPES (a zod replacement, zero-dep) ────────────────────────────────
 export const T = {
@@ -159,6 +160,7 @@ export function action<AS, TS>(_actor: Nature<AS>, name: string, def: {
     name, onName: def.on.name, from: def.from, to: def.to, input: undefined,
     when: w0 ? (a, t) => w0(a as unknown as Being<AS>, t as unknown as Being<TS>) : undefined,
     effect: e0 ? (t) => e0(t as unknown as Being<TS>) as Record<string, unknown> : undefined,
+    examples: [],
   }
   registry.set(def.on.name, [...(registry.get(def.on.name) ?? []), spec])
   const target = def.on as unknown as LNature
@@ -181,10 +183,27 @@ export function action<AS, TS>(_actor: Nature<AS>, name: string, def: {
     const patch = spec.effect ? spec.effect(t, inp) : {}
     return commit(target, targetId, { ...t, ...patch, ...(def.to != null ? { __state: def.to } : {}) })
   }
+  // record an example by RUNNING it against a throwaway store — it verifies real behavior,
+  // so a scenario cannot lie; it's also rendered to Given/When/Then by scenariosOf().
+  const record = (exName: string, actor: Row, targetRow: Row, input: Record<string, unknown> | undefined, expect: "ok" | "blocked"): void => {
+    const saved = store
+    const tmp = new MapStore()
+    useStore(tmp)
+    tmp.set("__actor", { ...actor })
+    tmp.set("__target", { ...targetRow })
+    const r = run("__actor", "__target", input)
+    useStore(saved)
+    spec.examples.push({ name: exName, actor, target: targetRow, input: (input ?? {}) as Row, expect, actual: r.ok ? "ok" : "blocked", why: r.ok ? undefined : r.why })
+  }
   const call = (actorId: string, targetId: string): Result => run(actorId, targetId)
-  return Object.assign(call, {
+  const api = Object.assign(call, {
     // would this action proceed right now? drives UI (disable a button) with NO drift from the spec
     allowed: (actorId: string, targetId: string): boolean => check(actorId, targetId).ok,
+    // an executed scenario: given actor/target, this action is allowed or rejected
+    example(exName: string, given: { actor: Being<NoInfer<AS>>; target: Being<NoInfer<TS>> }, expect: "ok" | "blocked") {
+      record(exName, given.actor as Row, given.target as Row, undefined, expect)
+      return api
+    },
     // add a typed payload — IS is inferred from `shape` and reused in `handlers` (cross-arg, reliable)
     input<IS extends Record<string, Field<unknown>>>(shape: IS, handlers: {
       when?: (actor: Being<NoInfer<AS>>, target: Being<NoInfer<TS>>, input: Infer<IS>) => boolean
@@ -194,11 +213,38 @@ export function action<AS, TS>(_actor: Nature<AS>, name: string, def: {
       spec.when = handlers.when ? (a, t, i) => handlers.when!(a as unknown as Being<AS>, t as unknown as Being<TS>, i as unknown as Infer<IS>) : undefined
       spec.effect = handlers.effect ? (t, i) => handlers.effect!(t as unknown as Being<TS>, i as unknown as Infer<IS>) as Record<string, unknown> : undefined
       const runIn = (actorId: string, targetId: string, input: Infer<IS>): Result => run(actorId, targetId, input as Record<string, unknown>)
-      return Object.assign(runIn, {
+      const apiIn = Object.assign(runIn, {
         allowed: (actorId: string, targetId: string, input: Infer<IS>): boolean => check(actorId, targetId, input as Record<string, unknown>).ok,
+        example(exName: string, given: { actor: Being<NoInfer<AS>>; target: Being<NoInfer<TS>>; input: Infer<IS> }, expect: "ok" | "blocked") {
+          record(exName, given.actor as Row, given.target as Row, given.input as Record<string, unknown>, expect)
+          return apiIn
+        },
       })
+      return apiIn
     },
   })
+  return api
+}
+
+// render every action's examples as Given/When/Then scenarios (a projection of the spec)
+export function scenariosOf(n: { name: string }): string[] {
+  const j = (o: Record<string, unknown>): string => JSON.stringify(o)
+  const out: string[] = []
+  for (const s of registry.get(n.name) ?? []) for (const ex of s.examples) {
+    out.push(
+      `Scenario: ${ex.name}\n` +
+      `  Given actor ${j(ex.actor)} and target ${j(ex.target)}\n` +
+      `  When ${s.name}(${j(ex.input)})\n` +
+      `  Then it is ${ex.expect === "ok" ? "allowed" : "rejected"}` +
+      (ex.actual !== ex.expect ? `  [MISMATCH: actually ${ex.actual}${ex.why ? ` — ${ex.why}` : ""}]` : ""),
+    )
+  }
+  return out
+}
+
+// results of every recorded example (pass = actual matched expected) — assert none failed in tests
+export function exampleResults(n: { name: string }): Array<{ action: string; name: string; pass: boolean; expect: string; actual: string; why: string | undefined }> {
+  return (registry.get(n.name) ?? []).flatMap(s => s.examples.map(ex => ({ action: s.name, name: ex.name, pass: ex.actual === ex.expect, expect: ex.expect, actual: ex.actual, why: ex.why })))
 }
 
 // spawn a being (validated through the same door as every write)
